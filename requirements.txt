@@ -1,2 +1,2 @@
-aries-staticagent==0.7.1
+aries-staticagent==0.5.0
 aiohttp
