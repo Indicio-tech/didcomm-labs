@@ -8,9 +8,7 @@ from aries_staticagent import (
     Module,
     route,
     crypto,
-    Message,
-    Keys,
-    Target
+    Message
 )
 
 from . import ProtocolStateMachine
@@ -127,8 +125,10 @@ class Connections(Module):
         """ Create and return an invite. """
         conn_vk, conn_sk = crypto.create_keypair()
         connection = StaticConnection(
-            Keys(conn_vk, conn_sk),
-            Target(their_vk=b'', endpoint=''),
+            conn_vk,
+            conn_sk,
+            b'',
+            '',
             dispatcher=self.dispatcher
         )
         conn_vk_b58 = crypto.bytes_to_b58(conn_vk)
@@ -156,10 +156,14 @@ class Connections(Module):
         their_conn_key = msg['recipientKeys'][0]
         my_vk, my_sk = crypto.create_keypair()
         new_connection = StaticConnection(
-            Keys(my_vk, my_sk),
-            Target(their_vk=msg['recipientKeys'][0], endpoint=msg['serviceEndpoint']),
+            my_vk,
+            my_sk,
+            msg['recipientKeys'][0],
+            msg['serviceEndpoint'],
             dispatcher=self.dispatcher
         )
+        new_connection.did = crypto.bytes_to_b58(my_vk[:16])
+        new_connection.vk_b58 = crypto.bytes_to_b58(my_vk)
         new_connection.state = ConnectionState()
         new_connection.state.role = Roles.INVITEE
         new_connection.state.transition(Events.RECV_INVITE)
@@ -177,12 +181,12 @@ class Connections(Module):
                         "id": new_connection.did + "#keys-1",
                         "type": "Ed25519VerificationKey2018",
                         "controller": new_connection.did,
-                        "publicKeyBase58": new_connection.verkey_b58
+                        "publicKeyBase58": new_connection.vk_b58
                     }],
                     "service": [{
                         "id": new_connection.did + ";indy",
                         "type": "IndyAgent",
-                        "recipientKeys": [new_connection.verkey_b58],
+                        "recipientKeys": [new_connection.vk_b58],
                         "routingKeys": [],
                         "serviceEndpoint": self.endpoint,
                     }],
@@ -193,27 +197,30 @@ class Connections(Module):
         new_connection.state.transition(Events.SEND_REQ)
 
     @route
-    async def request(self, msg: Message, agent):
+    async def request(self, msg, _agent):
         """ Process a request. """
         print(msg.pretty_print())
-        connection: StaticConnection = self.connections[msg.mtc.additional_data.recipient]
+        connection = self.connections[msg.mtc.ad['recip_vk']]
         connection.state.transition(Events.RECV_REQ)
 
         # Old connection keys, need to sign new keys with these
-        conn_vk, conn_sk = connection.verkey, connection.sigkey
+        conn_vk, conn_sk = connection.my_vk, connection.my_sk
+
+        # Relationship keys, replacing connection keys
+        my_vk, my_sk = crypto.create_keypair()
 
         # Update connection
-        their_did = msg['connection']['DIDDoc']['publicKey'][0]['controller']
-        their_vk = msg['connection']['DIDDoc']['publicKey'][0]['publicKeyBase58']
-        endpoint = msg['connection']['DIDDoc']['service'][0]['serviceEndpoint']
-        new_connection = StaticConnection.random(
-            Target(their_vk=their_vk, endpoint=endpoint)
+        connection.my_vk, connection.my_sk = my_vk, my_sk
+        connection.did = crypto.bytes_to_b58(my_vk[:16])
+        connection.vk_b58 = crypto.bytes_to_b58(my_vk)
+        connection.their_did = msg['connection']['DIDDoc']['publicKey'][0]['controller']
+        connection.their_vk = crypto.b58_to_bytes(
+            msg['connection']['DIDDoc']['publicKey'][0]['publicKeyBase58']
         )
-        new_connection.state = connection.state
+        connection.endpoint = msg['connection']['DIDDoc']['service'][0]['serviceEndpoint']
 
-        del self.connections[msg.mtc.additional_data.recipient]
-        self.connections[new_connection.verkey_b58] = new_connection
-        connection = new_connection
+        del self.connections[msg.mtc.ad['recip_vk']]
+        self.connections[connection.vk_b58] = connection
 
         # Prepare response
         connection_block = {
@@ -225,12 +232,12 @@ class Connections(Module):
                     "id": connection.did + "#keys-1",
                     "type": "Ed25519VerificationKey2018",
                     "controller": connection.did,
-                    "publicKeyBase58": connection.verkey_b58
+                    "publicKeyBase58": connection.vk_b58
                 }],
                 "service": [{
                     "id": connection.did + ";indy",
                     "type": "IndyAgent",
-                    "recipientKeys": [connection.verkey_b58],
+                    "recipientKeys": [connection.vk_b58],
                     "routingKeys": [],
                     "serviceEndpoint": self.endpoint,
                 }],
@@ -238,7 +245,6 @@ class Connections(Module):
         }
 
         connection.state.transition(Events.SEND_RESP)
-        connection._sessions = agent._sessions
 
         await connection.send_async({
             '@type': self.type('response'),
@@ -253,12 +259,13 @@ class Connections(Module):
             )
         })
 
+
     @route
     async def response(self, msg, _agent):
         """ Process a response. """
         print("Got response:", msg.pretty_print())
         their_conn_key = msg['connection~sig']['signer']
-        connection: StaticConnection = self.connections[their_conn_key]
+        connection = self.connections[their_conn_key]
 
         connection.state.transition(Events.RECV_RESP)
 
@@ -268,13 +275,12 @@ class Connections(Module):
 
         # Update connection
         del self.connections[their_conn_key]
-        their_did = msg['connection']['DIDDoc']['publicKey'][0]['controller']
-        their_vk = crypto.b58_to_bytes(
+        connection.their_did = msg['connection']['DIDDoc']['publicKey'][0]['controller']
+        connection.their_vk = crypto.b58_to_bytes(
             msg['connection']['DIDDoc']['publicKey'][0]['publicKeyBase58']
         )
-        endpoint = msg['connection']['DIDDoc']['service'][0]['serviceEndpoint']
-        connection.target.update(endpoint=endpoint, their_vk=their_vk)
-        self.connections[connection.verkey_b58] = connection
+        connection.endpoint = msg['connection']['DIDDoc']['service'][0]['serviceEndpoint']
+        self.connections[connection.vk_b58] = connection
 
         connection.state.transition(Events.SEND_ACK)
 
@@ -291,5 +297,5 @@ class Connections(Module):
     async def ack(self, msg, _agent):
         """ Process an ack. """
         print(msg.pretty_print())
-        connection = self.connections[msg.mtc.additional_data.recipient]
+        connection = self.connections[msg.mtc.ad['recip_vk']]
         connection.state.transition(Events.RECV_ACK)

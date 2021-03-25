@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import sys
 
 from aiohttp import web
 
@@ -9,9 +10,7 @@ from aries_staticagent import (
     StaticConnection,
     crypto,
     utils,
-    Message,
-    Keys,
-    Target
+    Message
 )
 
 from .protocols.connections import Connections
@@ -57,10 +56,11 @@ def recall_connection():
     with open('.keys', 'r') as key_file:
         info = json.load(key_file)
         return StaticConnection(
-            Keys(info['my_vk'], info['my_sk']),
-            Target(their_vk=info['their_vk'], endpoint=info['endpoint'])
+            info['my_vk'],
+            info['my_sk'],
+            info['their_vk'],
+            info['endpoint']
         )
-
 
 def main():
     """Main."""
@@ -86,11 +86,12 @@ def main():
             "content": "You said: {}".format(msg['content'])
         })
 
+
     async def handle(request):
         """aiohttp handle POST."""
         response = []
-        with conn.session(response.append) as session:
-            await session.handle(await request.read())
+        with conn.reply_handler(response.append):
+            await conn.handle(await request.read())
 
         if response:
             return web.Response(body=response.pop())
